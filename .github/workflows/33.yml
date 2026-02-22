@@ -1,0 +1,147 @@
+name: Auto Update BPB Worker
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 1 * * *"  # 每天凌晨1点自动更新
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制更新（忽略版本检查）'
+        required: false
+        default: false  # 使用布尔值而非字符串
+
+permissions:
+  contents: write
+
+jobs:
+  update-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # 步骤1：检出仓库代码
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # 步骤2：定义核心变量
+      - name: 定义环境变量
+        id: define_vars
+        run: |
+          echo "DEPLOY_FILE=_worker.js" >> $GITHUB_OUTPUT
+          echo "WORKER_NAME=111" >> $GITHUB_OUTPUT  # 替换为实际的Worker名称
+          echo "COMPATIBILITY_DATE=2026-02-21" >> $GITHUB_OUTPUT
+          echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases" >> $GITHUB_OUTPUT
+
+      # 步骤3：安装部署依赖
+      - name: 安装部署依赖
+        run: |
+          sudo apt update -y && sudo apt install -y jq wget unzip curl nodejs npm
+          npm install -g wrangler@4.67.0 --force
+          # 验证依赖安装
+          wrangler --version > /dev/null && echo "✅ wrangler安装成功" || (echo "❌ wrangler安装失败" && exit 1)
+          jq --version > /dev/null && echo "✅ jq安装成功" || (echo "❌ jq安装失败" && exit 1)
+
+      # 步骤4：下载并检查最新BPB代码（核心修复）
+      - name: 下载最新BPB代码并检查版本
+        id: download_code
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
+          set -e  # 出错立即终止
+
+          # 从步骤2获取变量（核心：避免变量为空）
+          DEPLOY_FILE="${{ steps.define_vars.outputs.DEPLOY_FILE }}"
+          REPO_URL="${{ steps.define_vars.outputs.REPO_URL }}"
+
+          # 获取本地版本
+          LOCAL_VERSION=$(cat version.txt 2>/dev/null | tr -d ' \n\r\t' || echo "unknown")
+          log "📌 本地当前版本: ${LOCAL_VERSION}"
+
+          # 获取最新Release信息
+          log "🔍 获取最新BPB Release信息..."
+          RESPONSE=$(curl -s --retry 5 --connect-timeout 20 \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "$REPO_URL")
+          
+          if [ -z "$RESPONSE" ]; then
+            log "❌ 获取最新Release信息失败"
+            exit 1
+          fi
+
+          # 提取版本号和下载地址
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name' | tr -d ' \n\r\t' || echo "latest")
+          DOWNLOAD_URL_JS=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name=="worker.js") | .browser_download_url')
+          DOWNLOAD_URL_ZIP=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name=="worker.zip") | .browser_download_url')
+          
+          log "📌 最新BPB版本: $TAG_NAME"
+
+          # 判断是否需要更新
+          FORCE_UPDATE=${{ github.event.inputs.force_update || false }}
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != true ]; then
+            log "✅ 已是最新版本，无需更新"
+            echo "need_deploy=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 下载最新代码（优先js文件，兜底zip）
+          log "📥 开始下载最新代码..."
+          if [ -n "$DOWNLOAD_URL_JS" ] && [ "$DOWNLOAD_URL_JS" != "null" ]; then
+            wget -q --tries=5 --timeout=30 -O worker.js "$DOWNLOAD_URL_JS" || { log "❌ 下载worker.js失败"; exit 1; }
+          elif [ -n "$DOWNLOAD_URL_ZIP" ] && [ "$DOWNLOAD_URL_ZIP" != "null" ]; then
+            wget -q --tries=5 --timeout=30 -O worker.zip "$DOWNLOAD_URL_ZIP" || { log "❌ 下载worker.zip失败"; exit 1; }
+            unzip -o worker.zip worker.js && rm -f worker.zip || { log "❌ 解压worker.zip失败"; exit 1; }
+          else
+            log "❌ 未找到可用的worker.js/worker.zip下载地址"
+            exit 1
+          fi
+
+          # 检查文件完整性
+          if [ ! -f "worker.js" ] || [ $(stat -c%s "worker.js") -lt 1024 ]; then
+            log "❌ 下载的代码文件为空或损坏（文件大小<1KB）"
+            exit 1
+          fi
+          log "✅ 代码下载完成，文件大小: $(stat -c%s "worker.js") 字节"
+
+          # 重命名为部署文件
+          mv worker.js "$DEPLOY_FILE"
+          echo "$TAG_NAME" > version.txt
+          
+          log "✅ 代码更新完成，新版本: $TAG_NAME"
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "need_deploy=true" >> $GITHUB_OUTPUT
+
+      # 步骤5：提交更新到GitHub仓库
+      - name: 提交代码更改
+        if: steps.download_code.outputs.need_deploy == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🔄 自动更新BPB Worker至版本: ${{ steps.download_code.outputs.tag_name }}"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+          file_patterns: "${{ steps.define_vars.outputs.DEPLOY_FILE }},version.txt"
+
+      # 步骤6：部署到Cloudflare Worker
+      - name: 部署到Cloudflare
+        if: steps.download_code.outputs.need_deploy == 'true'
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
+          
+          # 获取变量
+          DEPLOY_FILE="${{ steps.define_vars.outputs.DEPLOY_FILE }}"
+          WORKER_NAME="${{ steps.define_vars.outputs.WORKER_NAME }}"
+          COMPATIBILITY_DATE="${{ steps.define_vars.outputs.COMPATIBILITY_DATE }}"
+
+          log "🚀 开始部署到Cloudflare Worker..."
+          # 配置wrangler并部署
+          wrangler config set api-token "$CF_API_TOKEN"
+          wrangler deploy "$DEPLOY_FILE" \
+            --name "$WORKER_NAME" \
+            --account-id "$CF_ACCOUNT_ID" \
+            --compatibility-date "$COMPATIBILITY_DATE" || { log "❌ 部署到Cloudflare失败"; exit 1; }
+          
+          log "✅ 部署成功！Worker访问地址: https://$WORKER_NAME.$CF_ACCOUNT_ID.workers.dev"
