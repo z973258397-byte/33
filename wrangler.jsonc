@@ -1,1 +1,7 @@
-
+{
+  "name": "33",
+  "compatibility_date": "2026-02-22",
+  "main": "_worker.js",
+  "workers_dev": false,
+  "preview_urls": false
+}
