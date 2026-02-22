@@ -11,7 +11,7 @@ on:
       force_update:
         description: '是否强制更新（忽略版本检查）'
         required: false
-        default: false  # 使用布尔值而非字符串
+        default: 'false'  # 改为字符串，匹配Shell语法
 
 permissions:
   contents: write
@@ -24,20 +24,20 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
 
-      # 步骤2：定义核心变量
+      # 步骤2：定义核心变量（修复Worker名称+兼容日期）
       - name: 定义环境变量
         id: define_vars
         run: |
           echo "DEPLOY_FILE=_worker.js" >> $GITHUB_OUTPUT
-          echo "WORKER_NAME=111" >> $GITHUB_OUTPUT  # 替换为实际的Worker名称
-          echo "COMPATIBILITY_DATE=2026-02-21" >> $GITHUB_OUTPUT
+          echo "WORKER_NAME=33" >> $GITHUB_OUTPUT  # 改为实际部署的Worker名称
+          echo "COMPATIBILITY_DATE=2026-02-22" >> $GITHUB_OUTPUT  # 同步Pages部署日期
           echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases" >> $GITHUB_OUTPUT
 
-      # 步骤3：安装部署依赖
+      # 步骤3：安装部署依赖（修复wrangler版本）
       - name: 安装部署依赖
         run: |
           sudo apt update -y && sudo apt install -y jq wget unzip curl nodejs npm
-          npm install -g wrangler@4.67.0 --force
+          npm install -g wrangler@4.65.0 --force  # 降级到稳定版，避开4.67.0 Bug
           # 验证依赖安装
           wrangler --version > /dev/null && echo "✅ wrangler安装成功" || (echo "❌ wrangler安装失败" && exit 1)
           jq --version > /dev/null && echo "✅ jq安装成功" || (echo "❌ jq安装失败" && exit 1)
@@ -51,7 +51,7 @@ jobs:
           log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
           set -e  # 出错立即终止
 
-          # 从步骤2获取变量（核心：避免变量为空）
+          # 从步骤2获取变量
           DEPLOY_FILE="${{ steps.define_vars.outputs.DEPLOY_FILE }}"
           REPO_URL="${{ steps.define_vars.outputs.REPO_URL }}"
 
@@ -66,8 +66,9 @@ jobs:
             -H "Accept: application/vnd.github.v3+json" \
             "$REPO_URL")
           
-          if [ -z "$RESPONSE" ]; then
-            log "❌ 获取最新Release信息失败"
+          # 增强空值判断
+          if [ -z "$RESPONSE" ] || [ "$RESPONSE" = "[]" ]; then
+            log "❌ 获取最新Release信息失败（响应为空/无Release）"
             exit 1
           fi
 
@@ -78,15 +79,15 @@ jobs:
           
           log "📌 最新BPB版本: $TAG_NAME"
 
-          # 判断是否需要更新
-          FORCE_UPDATE=${{ github.event.inputs.force_update || false }}
-          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != true ]; then
+          # 修复强制更新逻辑（字符串对比）
+          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
             log "✅ 已是最新版本，无需更新"
             echo "need_deploy=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # 下载最新代码（优先js文件，兜底zip）
+          # 下载最新代码
           log "📥 开始下载最新代码..."
           if [ -n "$DOWNLOAD_URL_JS" ] && [ "$DOWNLOAD_URL_JS" != "null" ]; then
             wget -q --tries=5 --timeout=30 -O worker.js "$DOWNLOAD_URL_JS" || { log "❌ 下载worker.js失败"; exit 1; }
@@ -122,26 +123,32 @@ jobs:
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
           file_patterns: "${{ steps.define_vars.outputs.DEPLOY_FILE }},version.txt"
 
-      # 步骤6：部署到Cloudflare Worker
+      # 步骤6：部署到Cloudflare Worker（核心修复：移除废弃命令+新增秘钥检查）
       - name: 部署到Cloudflare
         if: steps.download_code.outputs.need_deploy == 'true'
         env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}  # 新版变量名
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
           log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
           
+          # 检查秘钥是否配置
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            log "❌ CF_API_TOKEN/CF_ACCOUNT_ID 未配置，请检查GitHub秘钥"
+            exit 1
+          fi
+
           # 获取变量
           DEPLOY_FILE="${{ steps.define_vars.outputs.DEPLOY_FILE }}"
           WORKER_NAME="${{ steps.define_vars.outputs.WORKER_NAME }}"
           COMPATIBILITY_DATE="${{ steps.define_vars.outputs.COMPATIBILITY_DATE }}"
 
           log "🚀 开始部署到Cloudflare Worker..."
-          # 配置wrangler并部署
-          wrangler config set api-token "$CF_API_TOKEN"
+          # 修复：移除废弃的config set命令，直接用环境变量部署
           wrangler deploy "$DEPLOY_FILE" \
             --name "$WORKER_NAME" \
-            --account-id "$CF_ACCOUNT_ID" \
-            --compatibility-date "$COMPATIBILITY_DATE" || { log "❌ 部署到Cloudflare失败"; exit 1; }
+            --account-id "$CLOUDFLARE_ACCOUNT_ID" \
+            --compatibility-date "$COMPATIBILITY_DATE" \
+            --verbose || { log "❌ 部署到Cloudflare失败"; exit 1; }
           
-          log "✅ 部署成功！Worker访问地址: https://$WORKER_NAME.$CF_ACCOUNT_ID.workers.dev"
+          log "✅ 部署成功！Worker访问地址: https://$WORKER_NAME.$CLOUDFLARE_ACCOUNT_ID.workers.dev"
