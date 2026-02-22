@@ -1,8 +1,5 @@
 {
   "name": "worker-name",
   "compatibility_date": "2026-02-22",
-  "main": "src/index.js",  // 指定入口脚本路径
-  "assets": {
-    "directory": "./dist"  // 如果你有静态资产，可以指定目录
-  }
+  "main": "src/main.js"  // 如果入口文件是 src/main.js
 }
